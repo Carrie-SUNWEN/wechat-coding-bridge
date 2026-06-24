@@ -26,8 +26,8 @@
 
 ```bash
 # 1) 拉代码
-git clone https://github.com/<你的账号>/<仓库名>.git
-cd <仓库名>
+git clone https://github.com/Carrie-SUNWEN/wechat-coding-bridge.git
+cd wechat-coding-bridge
 
 # 2) 装依赖
 npm install                 # 装底层微信通道包 cli-wechat-bridge@1.1.1
