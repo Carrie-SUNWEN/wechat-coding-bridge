@@ -1,0 +1,20 @@
+# 依赖
+node_modules/
+__pycache__/
+*.pyc
+
+# 运行期产生的本地数据(可能含隐私, 绝不提交)
+config.json
+session.json
+*.log
+.tmp/
+wechat-login-qr.png
+
+# 凭据(本就在 ~/.cli-bridge, 这里再挡一道)
+account.json
+context_tokens.json
+.cli-bridge/
+
+# 备份/临时
+*.bak
+*.bak-*

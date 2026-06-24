@@ -1,0 +1,25 @@
+{
+  "_说明": "把本文件复制为 config.json 后按需修改; 所有字段都可留空/删掉, 留空就用默认值",
+
+  "_adapter": "用哪个 coding 工具当大脑: claude(默认/功能最全) | codex | custom",
+  "adapter": "claude",
+
+  "_work_dir": "工作目录(放着你自己的 CLAUDE.md / 记忆); 留空=当前用户主目录。claude 和 codex 都用它当工作根目录",
+  "work_dir": "",
+
+  "_claude_exe": "[adapter=claude] claude 可执行文件路径; 留空=自动在系统 PATH 里找",
+  "claude_exe": "",
+  "_effort": "[adapter=claude] 思考强度 low|medium|high|xhigh|max; 缺省 high",
+  "effort": "high",
+
+  "_codex_exe": "[adapter=codex] codex 可执行文件路径; 留空=自动在系统 PATH 里找",
+  "codex_exe": "",
+  "_codex_exec_args": "[adapter=codex] 传给 codex exec 的参数; 缺省 --full-auto --skip-git-repo-check",
+  "codex_exec_args": ["--full-auto", "--skip-git-repo-check"],
+
+  "_custom": "[adapter=custom] 接任意'一句话出答案'的 CLI: cmd=命令名, args 里用 {prompt} 占位, 取 stdout 当回复(无多轮续接)。例(未在本机验证, 按你的版本确认): opencode -> cmd 'opencode', args ['run','{prompt}']",
+  "custom": {
+    "cmd": "",
+    "args": ["{prompt}"]
+  }
+}

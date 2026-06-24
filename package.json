@@ -1,0 +1,13 @@
+{
+  "name": "wechat-claude-code-bridge",
+  "version": "1.0.0",
+  "description": "Bridge your personal WeChat to your local coding agent (Claude Code / Codex / custom) via Tencent iLink. Send/receive text, files and images.",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "dependencies": {
+    "cli-wechat-bridge": "1.1.1"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
