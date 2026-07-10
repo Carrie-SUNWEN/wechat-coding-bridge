@@ -75,11 +75,14 @@ custom 示例（接 opencode，**未在本机验证**，按你的版本确认）
 | `codex_exe` | [codex] 可执行文件路径 | 自动在 PATH 里找 |
 | `codex_exec_args` | [codex] 传给 `codex exec` 的参数 | `--full-auto --skip-git-repo-check` |
 | `custom.cmd` / `custom.args` | [custom] 命令 + 参数（`{prompt}` 占位） | — |
+| `bg_timeout` | 后台重活的硬超时（秒） | `3600` |
+| `max_bg_tasks` | 最多同时跑几个后台重活 | `2` |
 
 ## 用法小贴士
 
 - **多轮对话**：自动接上下文（存 `session.json`）。发 `/reset`（或 `重置`）开新对话。
 - **发文件给自己**：让 Claude 在回复里写一行 `[[SENDFILE:绝对路径]]` 或 `[[SENDIMAGE:绝对路径|配文]]`，桥会自动发出去。
+- **后台重活（新）**：聊天线程每条消息有 10 分钟硬超时，重活（调研、批量下载、跑长脚本）以前会"想太久超时"且工作全部作废。现在大脑会自动把这类任务写成 `[[BGTASK:自包含描述]]` 转给独立后台会话跑（缺省限时 1 小时、最多同时 2 个），微信里秒回"已开始"，跑完自动把结果（可带文件）发回来；失败/超时也会发 ❌ 通知。三种适配器都支持。
 - **只测大脑**（不走微信）：`python wechat_bridge.py selftest`。
 
 ## 文件说明

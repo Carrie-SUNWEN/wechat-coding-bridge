@@ -21,5 +21,10 @@
   "custom": {
     "cmd": "",
     "args": ["{prompt}"]
-  }
+  },
+
+  "_bg_timeout": "后台重活([[BGTASK:...]])的硬超时秒数; 缺省 3600(1小时)",
+  "bg_timeout": 3600,
+  "_max_bg_tasks": "最多同时跑几个后台重活; 缺省 2",
+  "max_bg_tasks": 2
 }

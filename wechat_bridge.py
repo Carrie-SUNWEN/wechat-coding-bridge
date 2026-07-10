@@ -7,9 +7,11 @@ iLink getupdates(收) -> 队列 -> 后台 worker: claude -p(大脑) -> iLink sen
 - 生产者(主循环): 持续 getupdates -> 去重/主人校验/ctx -> /reset 内联 -> 立刻回执 -> 入队 -> 继续轮询。永不被处理阻塞。
 - 消费者(后台单 worker 线程): 串行 receive_message(媒体下载解密) + run_claude + 回复。串行保会话连续性, 不让并行 claude --resume 串台。
 - 所有子进程统一 run_proc: 硬超时 + 超时 taskkill /F /T 杀整棵进程树(防卡死/僵尸 claude)。
+- 后台重活: 大脑回复带 [[BGTASK:自包含描述]] 即转独立线程+全新会话跑(缺省限时1h, 最多同时2个),
+  聊天线程秒回不被占用, 跑完由 bg_task 主动把结果发回微信。
 中文通过 claude 的进程参数传递(Windows CreateProcessW 宽字符), 不乱码。
 
-配置: 同目录 config.json(可选), 字段 claude_exe / work_dir / effort 全部可缺省, 见 config.example.json。
+配置: 同目录 config.json(可选), 字段 claude_exe / work_dir / effort / bg_timeout / max_bg_tasks 全部可缺省, 见 config.example.json。
 """
 import json, os, sys, time, datetime, subprocess, secrets, base64, re
 import threading, queue
@@ -28,6 +30,8 @@ LOG_FILE = os.path.join(PROJ_DIR, "wechat_bridge.log")
 
 # 发送本地文件/图片的指令: 模型在回复里写 [[SENDFILE:路径]] / [[SENDFILE:路径|显示名]] / [[SENDIMAGE:路径|配文]]
 MEDIA_RE = re.compile(r"\[\[SEND(FILE|IMAGE):([^\]]+)\]\]")
+# 后台重活指令: 大脑在回复里写 [[BGTASK:自包含任务描述]], 桥转独立后台会话跑, 不占聊天线程
+BGTASK_RE = re.compile(r"\[\[BGTASK:(.+?)\]\]", re.S)
 
 CHANNEL_VERSION = "0.3.0"
 
@@ -84,6 +88,9 @@ _CUSTOM = _CFG.get("custom") or {}
 CLAUDE_TIMEOUT = 600
 RECV_TIMEOUT = 180
 SEND_TIMEOUT = 300
+# 后台重活: 硬超时与并发上限(可在 config.json 用 bg_timeout / max_bg_tasks 覆盖)
+BG_TIMEOUT = int(_CFG.get("bg_timeout") or 3600)
+MAX_BG_TASKS = int(_CFG.get("max_bg_tasks") or 2)
 
 BRIDGE_PROMPT = (
     "你正在通过【微信】和你的主人对话, 你是 TA 的私人 AI 助手。"
@@ -93,6 +100,18 @@ BRIDGE_PROMPT = (
     "在回复里单独加一行指令: 发文件用 [[SENDFILE:绝对路径]] 或 [[SENDFILE:绝对路径|显示文件名]]; "
     "发图片用 [[SENDIMAGE:绝对路径]] 或 [[SENDIMAGE:绝对路径|配文]]。桥会自动把文件发出去并把这行指令从消息里删掉。"
     "只在确认文件真实存在时用; 图片≤20MB、文件≤50MB。"
+    "【后台重活能力】你这一次回复有硬性时间上限(缺省 10 分钟), 超时会被强行终止且已做的工作全部作废。"
+    "所以凡是预计要好几分钟以上的重活(调研、批量下载、跑长脚本、批量生成内容等), 不要当场自己干: "
+    "在回复里单独加一行 [[BGTASK:任务的完整描述]], 桥会交给一个独立的后台会话慢慢跑(缺省限时 1 小时), 跑完自动把结果发回微信。"
+    "注意后台会话看不到你们的聊天记录, 所以 BGTASK 描述必须自包含: 把需求、数量、路径等聊天里已确认的上下文全部写进去。"
+    "正文里简短告诉主人任务已转后台即可。简单问题照常直接回答, 不要滥用后台。"
+)
+
+BG_PROMPT = (
+    "你是主人的私人 AI 助手的后台执行分身, 正在替主人跑一个后台重活任务。"
+    "你看不到微信聊天历史, 任务描述里已包含全部上下文, 按描述独立完成。"
+    "你这一整段最终回复会被原样作为一条微信消息发给主人: 用口语化、简洁的话汇报任务结果; "
+    "长产物写入文件, 微信里只给摘要+文件路径; 要把文件/图片发到微信就单独加一行 [[SENDFILE:绝对路径]] 或 [[SENDIMAGE:绝对路径|配文]]。"
 )
 
 # Windows: spawn 子进程(claude/node)时不弹出黑色控制台窗口(配合 pythonw 静默后台运行)
@@ -113,6 +132,8 @@ if sys.stdout is None or sys.stderr is None:
 WORK_Q = queue.Queue()          # 生产者塞 (account, msg, frm, use_ctx); worker 取
 LATEST_CTX = {}                 # frm -> 最新 context_token (生产者写, worker 读)
 _LOG_LOCK = threading.Lock()    # 多线程写日志不串行
+_BG_LOCK = threading.Lock()     # 后台重活计数锁
+BG_RUNNING = 0                  # 当前在跑的后台重活数(受 _BG_LOCK 保护)
 
 
 def log(msg):
@@ -347,6 +368,67 @@ def run_custom(text):
     return reply
 
 
+def run_brain_bg(desc):
+    """后台重活: 全新独立会话(不续接、不动聊天会话状态), 长超时。
+    返回 (最终文本 或 None, 失败原因)。三种适配器都支持。"""
+    if ADAPTER == "codex":
+        os.makedirs(TMP_DIR, exist_ok=True)
+        last_file = os.path.join(TMP_DIR, "codex_bg_%s.txt" % secrets.token_hex(4))
+        args = [CODEX_EXE, "exec"] + list(CODEX_EXEC_ARGS) + ["-C", CWD, "-o", last_file, "-"]
+        stdin_text = BG_PROMPT + "\n\n----\n后台任务: " + desc
+        status, out, err = run_proc(args, CWD, BG_TIMEOUT, stdin_text=stdin_text)
+        reply = ""
+        try:
+            if os.path.exists(last_file):
+                with open(last_file, encoding="utf-8", errors="replace") as f:
+                    reply = f.read().strip()
+        except Exception:
+            pass
+        finally:
+            try:
+                os.remove(last_file)
+            except Exception:
+                pass
+    elif ADAPTER == "custom":
+        cmd = _CUSTOM.get("cmd")
+        if not cmd:
+            return None, "未配置 custom.cmd"
+        raw_args = _CUSTOM.get("args") or ["{prompt}"]
+        prompt = BG_PROMPT + "\n\n----\n后台任务: " + desc
+        args = [cmd] + [(a.replace("{prompt}", prompt) if isinstance(a, str) else str(a)) for a in raw_args]
+        status, out, err = run_proc(args, CWD, BG_TIMEOUT)
+        reply = (out or "").strip()
+    else:
+        args = [CLAUDE_EXE, "-p", desc,
+                "--output-format", "stream-json", "--verbose",
+                "--permission-mode", "bypassPermissions",
+                "--strict-mcp-config",
+                "--effort", EFFORT,
+                "--append-system-prompt", BG_PROMPT]
+        status, out, err = run_proc(args, CWD, BG_TIMEOUT)
+        reply = None
+        for line in (out or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("type") == "result":
+                reply = ev.get("result")
+    if status == "timeout":
+        log("后台任务超时(%ds, 已杀进程树)" % BG_TIMEOUT)
+        return None, "超过时限被终止"
+    if status != "ok":
+        log("后台任务启动失败(%s): %s" % (status, (err or "")[:160]))
+        return None, "启动失败"
+    if not reply:
+        log("后台任务无结果. stderr=%s" % (err or "")[:200])
+        return None, "跑完但没有产出结果"
+    return reply, ""
+
+
 def send_text(account, to_user_id, context_token, text):
     body = {
         "msg": {
@@ -408,6 +490,73 @@ def split_media_directives(reply):
 
     text = MEDIA_RE.sub(repl, reply).strip()
     return text, medias
+
+
+def split_bg_directives(reply):
+    """从回复里抽出后台重活指令, 返回(去掉指令后的纯文本, [任务描述, ...])。"""
+    descs = []
+
+    def repl(m):
+        d = m.group(1).strip()
+        if d:
+            descs.append(d)
+        return ""
+
+    return BGTASK_RE.sub(repl, reply).strip(), descs
+
+
+def deliver_reply(account, frm, send_ctx, reply, prefix=""):
+    """把大脑回复(含发文件指令)投递到微信: 先发文本, 再逐个发文件/图片。"""
+    clean_text, medias = split_media_directives(reply)
+    out_text = (prefix + clean_text).strip() if (prefix or clean_text) else ""
+    if out_text:
+        try:
+            send_text(account, frm, send_ctx, out_text)
+            log("已回复 %d 字" % len(out_text))
+        except Exception as e:
+            log("send reply err: %s" % str(e)[:140])
+    for kind, fpath, label in medias:
+        try:
+            if send_media(kind, fpath, frm, label):
+                log("已发%s: %s" % ("图片" if kind == "IMAGE" else "文件", os.path.basename(fpath)))
+            else:
+                send_text(account, frm, send_ctx, "(发送文件失败: %s, 看下路径或大小是否超限)" % os.path.basename(fpath))
+        except Exception as e:
+            log("send media err: %s" % str(e)[:140])
+
+
+def bg_task(account, frm, desc):
+    """后台重活线程: 独立会话跑完后主动把结果发回微信。"""
+    global BG_RUNNING
+    short = desc[:24].replace("\n", " ")
+    t0 = time.time()
+    try:
+        log("后台任务开跑: %s" % desc[:100].replace("\n", " "))
+        reply, fail_why = run_brain_bg(desc)
+        mins = (time.time() - t0) / 60.0
+        send_ctx = LATEST_CTX.get(frm)
+        if not send_ctx:
+            log("后台任务结束但无 context_token, 结果发不回微信(任务: %s)" % short)
+            return
+        if reply is None:
+            send_text(account, frm, send_ctx,
+                      "❌ 后台任务「%s…」没跑成(%s, 用时 %.0f 分钟)。部分产物可能已落盘, 可以让我接着查。" % (short, fail_why, mins))
+            return
+        # 后台回复里若再出现 BGTASK 指令, 只剥掉不再递归开任务
+        reply, _nested = split_bg_directives(reply)
+        deliver_reply(account, frm, send_ctx, reply,
+                      prefix="✅ 后台任务完成(用时 %.0f 分钟):\n" % mins)
+    except Exception as e:
+        log("bg_task err: %s" % str(e)[:200])
+        try:
+            ctx = LATEST_CTX.get(frm)
+            if ctx:
+                send_text(account, frm, ctx, "❌ 后台任务「%s…」出错了, 详见桥日志。" % short)
+        except Exception:
+            pass
+    finally:
+        with _BG_LOCK:
+            BG_RUNNING -= 1
 
 
 def extract_text(msg):
@@ -473,21 +622,21 @@ def process_one(account, msg, frm, use_ctx):
         return
     reply = run_brain(text)
     send_ctx = LATEST_CTX.get(frm) or use_ctx
-    clean_text, medias = split_media_directives(reply)
-    if clean_text:
-        try:
-            send_text(account, frm, send_ctx, clean_text)
-            log("已回复 %d 字" % len(clean_text))
-        except Exception as e:
-            log("send reply err: %s" % str(e)[:140])
-    for kind, fpath, label in medias:
-        try:
-            if send_media(kind, fpath, frm, label):
-                log("已发%s: %s" % ("图片" if kind == "IMAGE" else "文件", os.path.basename(fpath)))
-            else:
-                send_text(account, frm, send_ctx, "(发送文件失败: %s, 看下路径或大小是否超限)" % os.path.basename(fpath))
-        except Exception as e:
-            log("send media err: %s" % str(e)[:140])
+    # 抽出后台重活指令, 逐个转独立线程跑(不占聊天线程的时间额度)
+    global BG_RUNNING
+    reply, bg_descs = split_bg_directives(reply)
+    notes = []
+    for desc in bg_descs:
+        with _BG_LOCK:
+            if BG_RUNNING >= MAX_BG_TASKS:
+                notes.append("(后台已有 %d 个任务在跑, 这个先没接: %s… 等会儿再发一次)"
+                             % (MAX_BG_TASKS, desc[:24].replace("\n", " ")))
+                continue
+            BG_RUNNING += 1
+        threading.Thread(target=bg_task, args=(account, frm, desc), daemon=True).start()
+    if notes:
+        reply = (reply + "\n" + "\n".join(notes)).strip()
+    deliver_reply(account, frm, send_ctx, reply)
 
 
 def worker():
